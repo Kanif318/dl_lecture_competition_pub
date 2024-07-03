@@ -13,6 +13,8 @@ pandas = "*"
 torch = {version = "*", index = "torch_stable"}
 torchvision = {version = "*", index = "torch_stable"}
 torchaudio = {version = "*", index = "torch_stable"}
+transformers = "*"
+wandb = "*"
 
 [dev-packages]
 

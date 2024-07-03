@@ -2,14 +2,30 @@ import re
 import random
 import time
 from statistics import mode
+import pickle
+import os
 
 from PIL import Image
 import numpy as np
 import pandas
 import torch
 import torch.nn as nn
-import torchvision
 from torchvision import transforms
+from transformers import AutoTokenizer, AutoModel
+from torch import Tensor
+import torch.nn.functional as F
+import csv
+import wandb
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+model_name = "intfloat/multilingual-e5-large"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+embedding_model = AutoModel.from_pretrained(model_name).to(device)
+# embedding_model のすべてのパラメータを凍結
+for param in embedding_model.parameters():
+    param.requires_grad = False
 
 
 def set_seed(seed):
@@ -22,6 +38,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
+#テキストの前処理
 def process_text(text):
     # lowercase
     text = text.lower()
@@ -35,7 +52,7 @@ def process_text(text):
     for word, digit in num_word_to_digit.items():
         text = text.replace(word, digit)
 
-    # 小数点のピリオドを削除
+    # 小数点以外のピリオドを削除
     text = re.sub(r'(?<!\d)\.(?!\d)', '', text)
 
     # 冠詞の削除
@@ -49,10 +66,11 @@ def process_text(text):
     for contraction, correct in contractions.items():
         text = text.replace(contraction, correct)
 
-    # 句読点をスペースに変換
+    # 英数字、アンダースコア、空白、シングルクォート、コロン以外のすべての記号や句読点をスペースに変換
+    # ^キャレット記号によって除外を表現．[]キャラクタークラスの中でキャレット記号が最初に置かれた場合そのクラスを含まない文字にマッチするという意味になる
     text = re.sub(r"[^\w\s':]", ' ', text)
 
-    # 句読点をスペースに変換
+    # カンマの前にある一つ以上の空白にマッチし，それをカンマだけに置き換える
     text = re.sub(r'\s+,', ',', text)
 
     # 連続するスペースを1つに変換
@@ -60,39 +78,56 @@ def process_text(text):
 
     return text
 
+def average_pool(last_hidden_states: Tensor,
+                 attention_mask: Tensor) -> Tensor:
+    last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+    return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
-    def __init__(self, df_path, image_dir, transform=None, answer=True):
+    def __init__(self, df_path, image_dir, transform=None, answer=True, dict_path='answer_dict.pkl'):
         self.transform = transform  # 画像の前処理
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
         self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
         self.answer = answer
+        self.dict_path = dict_path
 
-        # question / answerの辞書を作成
-        self.question2idx = {}
-        self.answer2idx = {}
-        self.idx2question = {}
-        self.idx2answer = {}
 
-        # 質問文に含まれる単語を辞書に追加
-        for question in self.df["question"]:
-            question = process_text(question)
-            words = question.split(" ")
-            for word in words:
-                if word not in self.question2idx:
-                    self.question2idx[word] = len(self.question2idx)
-        self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
+        if os.path.exists(self.dict_path):
+            # 既存の辞書を読み込む
+            with open(self.dict_path, 'rb') as f:
+                self.answer2idx = pickle.load(f)
+        else:
+            # 新しい辞書を作成
+            self.answer2idx = {}
 
         if self.answer:
-            # 回答に含まれる単語を辞書に追加
-            for answers in self.df["answers"]:
-                for answer in answers:
-                    word = answer["answer"]
-                    word = process_text(word)
-                    if word not in self.answer2idx:
-                        self.answer2idx[word] = len(self.answer2idx)
-            self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
+            # DataFrameから辞書を更新
+            self.update_dict_from_df()
+
+            # CSVから辞書を更新
+            self.update_dict_from_csv('class_mapping.csv')
+
+            # 辞書を逆にして保存
+            self.idx2answer = {v: k for k, v in self.answer2idx.items()}
+
+            # 辞書をファイルに保存
+            with open(self.dict_path, 'wb') as f:
+                pickle.dump(self.answer2idx, f)
+
+    def update_dict_from_df(self):
+        for answers in self.df["answers"]:
+            for answer in answers:
+                word = process_text(answer["answer"])
+                if word not in self.answer2idx:
+                    self.answer2idx[word] = len(self.answer2idx)
+
+    def update_dict_from_csv(self, csv_path):
+        class_data = pandas.read_csv(csv_path)
+        for _, row in class_data.iterrows():
+            word = row['answer']
+            if word not in self.answer2idx:
+                self.answer2idx[word] = row['class_id']
 
     def update_dict(self, dataset):
         """
@@ -103,9 +138,7 @@ class VQADataset(torch.utils.data.Dataset):
         dataset : Dataset
             訓練データのDataset
         """
-        self.question2idx = dataset.question2idx
         self.answer2idx = dataset.answer2idx
-        self.idx2question = dataset.idx2question
         self.idx2answer = dataset.idx2answer
 
     def __getitem__(self, idx):
@@ -130,22 +163,19 @@ class VQADataset(torch.utils.data.Dataset):
         """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
-
+        # questionそのままを渡す
+        question = self.df['question'][idx]
+        
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
+            # print("answers", answers)
+            # print("mode_answer_idx", mode_answer_idx)
 
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+            return image, question, torch.Tensor(answers), int(mode_answer_idx)
 
         else:
-            return image, torch.Tensor(question)
+            return image, question
 
     def __len__(self):
         return len(self.df)
@@ -153,6 +183,8 @@ class VQADataset(torch.utils.data.Dataset):
 
 # 2. 評価指標の実装
 # 簡単にするならBCEを利用する
+# 10人の回答の内9人の回答を選択し，その10パターンのAccの平均をそのデータに対するAccとする．
+# iが除外する回答の選択，jがそれ以外の回答を回る．
 def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
     total_acc = 0.
 
@@ -288,29 +320,63 @@ def ResNet50():
 
 
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, n_answer: int):
         super().__init__()
-        self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
-
+        self.resnet = ResNet50()
+        # multilingual-e5
+        self.text_encoder = embedding_model
+        # Normalize入れる
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(1536, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
             nn.Linear(512, n_answer)
         )
+        self.log_softmax = nn.LogSoftmax(dim=1)
 
     def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+        attention_mask = question['attention_mask']
 
-        x = torch.cat([image_feature, question_feature], dim=1)
+        image_feature = self.resnet(image)  # 画像の特徴量
+
+        question_feature = self.text_encoder(**question)  # テキストの特徴量
+        embeddings = average_pool(question_feature.last_hidden_state, attention_mask)
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+
+        x = torch.cat([image_feature, embeddings], dim=1)
         x = self.fc(x)
 
-        return x
+        return self.log_softmax(x)
 
+def calculate_soft_labels(answers, num_classes):
+    batch_size, num_answers = answers.shape
+
+    answers = answers.long()
+
+    soft_labels = torch.zeros(batch_size, num_classes).to(device)
+    #answersはバッチで入ってきているので，バッチサイズ＊回答数
+    #answerは10個（回答数）のインデックス
+    # バッチ内の各データポイントに対して処理
+    for i in range(batch_size):
+        label_counts = torch.zeros(num_classes).to(device)
+        
+        # 各回答に対するカウント
+        for j in range(num_answers):
+            label_counts[answers[i, j]] += 1
+        
+        # 最頻値のインデックスを見つけ、そのカウントを二倍にする
+        mode_index = torch.argmax(label_counts)
+        label_counts[mode_index] *= 2
+        
+        # ソフトラベルを計算（正規化）
+        soft_labels[i] = label_counts / label_counts.sum()
+    
+    return soft_labels
 
 # 4. 学習の実装
-def train(model, dataloader, optimizer, criterion, device):
+def train(model, dataloader, optimizer, criterion, device, dataset):
+    dataset = dataset
     model.train()
 
     total_loss = 0
@@ -319,11 +385,15 @@ def train(model, dataloader, optimizer, criterion, device):
 
     start = time.time()
     for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
+        # print("image", image)
+        # print("question", question)
+        image, question, answers, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
-
+        
+        soft_labels = calculate_soft_labels(answers, num_classes=len(dataset.answer2idx))
+        soft_labels = soft_labels.to(device)
         pred = model(image, question)
-        loss = criterion(pred, mode_answer.squeeze())
+        loss = criterion(pred, soft_labels)
 
         optimizer.zero_grad()
         loss.backward()
@@ -357,8 +427,36 @@ def eval(model, dataloader, optimizer, criterion, device):
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
+def custom_collate_fn(batch):
+    images, questions, answers, mode_answers = zip(*batch)
+    # 画像はそのままスタック
+    images = torch.stack(images, dim=0)
+    # 質問はパディング
+    questions = tokenizer(questions, padding=True, return_tensors='pt')
+    # 回答も同様にパディング
+    answers = torch.stack(answers, dim=0)
+    mode_answers = torch.tensor(mode_answers, dtype = torch.long)
+    return images, questions, answers, mode_answers
+
+def custom_collate_fntest(batch):
+    images, questions = zip(*batch)
+    # 画像はそのままスタック
+    images = torch.stack(images, dim=0)
+    # 質問はパディング
+    questions = tokenizer(questions, padding=True, return_tensors='pt')
+    return images, questions
 
 def main():
+    wandb.init(
+        project="vqa_project",
+        config={
+        "learning_rate": 0.001,
+        "architecture": "transformer+CNN+FC",
+        "dataset": "VizWiz",
+        "epochs": 20,
+        }
+    )
+
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -372,19 +470,21 @@ def main():
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, collate_fn = custom_collate_fn)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn = custom_collate_fntest)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
     num_epoch = 20
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.KLDivLoss(reduction='batchmean')
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
     # train model
     for epoch in range(num_epoch):
-        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
+        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device, train_dataset)
+        # wandbによるログ記録
+        wandb.log({"loss": train_loss, "accuracy": train_acc, "simple_accuracy": train_simple_acc})
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
               f"train loss: {train_loss:.4f}\n"
@@ -394,16 +494,27 @@ def main():
     # 提出用ファイルの作成
     model.eval()
     submission = []
+    preds = []
+    pred_answers = []
     for image, question in test_loader:
         image, question = image.to(device), question.to(device)
         pred = model(image, question)
         pred = pred.argmax(1).cpu().item()
         submission.append(pred)
+        preds.append(pred)
+        pred_answers.append(train_dataset.idx2answer[pred])
 
+    # CSVファイルに保存
+    with open('predictions.csv', 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Prediction Index', 'Answer Text'])
+        for pred, answer in zip(preds, pred_answers):
+            writer.writerow([pred, answer])
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
     torch.save(model.state_dict(), "model.pth")
-    np.save("submission.npy", submission)
+    np.save("submission_3.npy", submission)
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
