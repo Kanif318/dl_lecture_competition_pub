@@ -4,6 +4,7 @@ import time
 from statistics import mode
 import pickle
 import os
+import datetime
 
 from PIL import Image
 import numpy as np
@@ -11,21 +12,30 @@ import pandas
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from transformers import AutoTokenizer, AutoModel
 from torch import Tensor
 import torch.nn.functional as F
 import csv
 import wandb
+from transformers import CLIPProcessor, CLIPModel
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-model_name = "intfloat/multilingual-e5-large"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-embedding_model = AutoModel.from_pretrained(model_name).to(device)
-# embedding_model のすべてのパラメータを凍結
-for param in embedding_model.parameters():
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+# テキストエンコーダーを取得
+text_encoder = model.text_model.to(device)
+# 画像エンコーダーを取得
+vision_encoder = model.vision_model.to(device)
+#トークナイザー
+tokenizer = processor.tokenizer
+
+#すべてのパラメータを凍結
+for param in text_encoder.parameters():
     param.requires_grad = False
+for param in vision_encoder.parameters():
+    param.requires_grad = False
+
 
 
 def set_seed(seed):
@@ -107,6 +117,7 @@ class VQADataset(torch.utils.data.Dataset):
 
             # CSVから辞書を更新
             self.update_dict_from_csv('class_mapping.csv')
+            print(len(self.answer2idx))
 
             # 辞書を逆にして保存
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}
@@ -165,13 +176,10 @@ class VQADataset(torch.utils.data.Dataset):
         image = self.transform(image)
         # questionそのままを渡す
         question = self.df['question'][idx]
-        
+
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
-            # print("answers", answers)
-            # print("mode_answer_idx", mode_answer_idx)
-
             return image, question, torch.Tensor(answers), int(mode_answer_idx)
 
         else:
@@ -203,151 +211,48 @@ def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
     return total_acc / len(batch_pred)
 
 
-# 3. モデルのの実装
-# ResNetを利用できるようにしておく
-class BasicBlock(nn.Module):
-    expansion = 1
+#モデルの実装
+class CrossModalAttention(nn.Module):
+    def __init__(self, feature_dim, num_heads):
+        super(CrossModalAttention, self).__init__()
+        self.query = nn.Linear(feature_dim, feature_dim)
+        self.key = nn.Linear(feature_dim, feature_dim)
+        self.value = nn.Linear(feature_dim, feature_dim)
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads)
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
-        super().__init__()
+    def forward(self, text_features, image_features):
+        # クエリはテキスト特徴量、キーとバリューは画像特徴量
+        query = self.query(text_features).permute(1, 0, 2)  # (batch_size, seq_length, feature_dim)
+        key = self.key(image_features).permute(1, 0, 2)
+        value = self.value(image_features).permute(1, 0, 2)
 
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride),
-                nn.BatchNorm2d(out_channels)
-            )
-
-    def forward(self, x):
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-
-        out += self.shortcut(residual)
-        out = self.relu(out)
-
-        return out
-
-
-class BottleneckBlock(nn.Module):
-    expansion = 4
-
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
-        super().__init__()
-
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.conv3 = nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=1, stride=1)
-        self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels * self.expansion:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride),
-                nn.BatchNorm2d(out_channels * self.expansion)
-            )
-
-    def forward(self, x):
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
-
-        out += self.shortcut(residual)
-        out = self.relu(out)
-
-        return out
-
-
-class ResNet(nn.Module):
-    def __init__(self, block, layers):
-        super().__init__()
-        self.in_channels = 64
-
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        self.layer1 = self._make_layer(block, layers[0], 64)
-        self.layer2 = self._make_layer(block, layers[1], 128, stride=2)
-        self.layer3 = self._make_layer(block, layers[2], 256, stride=2)
-        self.layer4 = self._make_layer(block, layers[3], 512, stride=2)
-
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 * block.expansion, 512)
-
-    def _make_layer(self, block, blocks, out_channels, stride=1):
-        layers = []
-        layers.append(block(self.in_channels, out_channels, stride))
-        self.in_channels = out_channels * block.expansion
-        for _ in range(1, blocks):
-            layers.append(block(self.in_channels, out_channels))
-
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-
-        x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
-
-        return x
-
-
-def ResNet18():
-    return ResNet(BasicBlock, [2, 2, 2, 2])
-
-
-def ResNet50():
-    return ResNet(BottleneckBlock, [3, 4, 6, 3])
-
+        # アテンションの計算
+        attn_output, _ = self.multihead_attn(query, key, value)
+        return attn_output.permute(1, 0, 2)
 
 class VQAModel(nn.Module):
-    def __init__(self, n_answer: int):
+    def __init__(self, n_answer: int, text_dim, image_dim, num_heads):
         super().__init__()
-        self.resnet = ResNet50()
-        # multilingual-e5
-        self.text_encoder = embedding_model
-        # Normalize入れる
+        self.text_encoder = text_encoder(text_dim)  # テキストエンコーダー
+        self.image_encoder = vision_encoder(image_dim)  # 画像エンコーダー
+        self.text_projection = nn.Linear(text_dim, image_dim)  # テキスト特徴量を画像特徴量と同じ次元に変換
+        self.cross_modal_attn = CrossModalAttention(image_dim, num_heads)  # 統一された次元でアテンション
         self.fc = nn.Sequential(
-            nn.Linear(1536, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(image_dim, 1024),
+            nn.BatchNorm1d(1024),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(512, n_answer)
+            nn.Linear(1024, n_answer)
         )
         self.log_softmax = nn.LogSoftmax(dim=1)
 
-    def forward(self, image, question):
-        attention_mask = question['attention_mask']
-
-        image_feature = self.resnet(image)  # 画像の特徴量
-
-        question_feature = self.text_encoder(**question)  # テキストの特徴量
-        embeddings = average_pool(question_feature.last_hidden_state, attention_mask)
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-
-        x = torch.cat([image_feature, embeddings], dim=1)
-        x = self.fc(x)
-
-        return self.log_softmax(x)
+    def forward(self, text, image):
+        text_features = self.text_encoder(text)
+        image_features = self.image_image_encoder(image)
+        text_features = self.text_projection(text_features)  # テキスト特徴量を変換
+        combined_features = self.cross_modal_attn(text_features, image_features)
+        output = self.fc(combined_features.mean(dim=1))
+        return self.log_softmax(output)
 
 def calculate_soft_labels(answers, num_classes):
     batch_size, num_answers = answers.shape
@@ -364,10 +269,6 @@ def calculate_soft_labels(answers, num_classes):
         # 各回答に対するカウント
         for j in range(num_answers):
             label_counts[answers[i, j]] += 1
-        
-        # 最頻値のインデックスを見つけ、そのカウントを二倍にする
-        mode_index = torch.argmax(label_counts)
-        label_counts[mode_index] *= 2
         
         # ソフトラベルを計算（正規化）
         soft_labels[i] = label_counts / label_counts.sum()
@@ -451,9 +352,10 @@ def main():
         project="vqa_project",
         config={
         "learning_rate": 0.001,
-        "architecture": "transformer+CNN+FC",
+        "architecture": "CLIP+FC",
         "dataset": "VizWiz",
-        "epochs": 20,
+        "epochs": 10,
+        "fine-tuning": "no"
         }
     )
 
@@ -461,22 +363,35 @@ def main():
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # dataloader / model
+    # CLIPに合わせた画像前処理
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.Resize(224),  # 最短辺を224にリサイズ
+        transforms.CenterCrop(224),  # 中央を224x224でクロップ
+        transforms.ToTensor(),  # PIL Imageまたはnumpy.ndarrayをTensorに変換
+        transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],  # CLIPの平均
+                            std=[0.26862954, 0.26130258, 0.27577711])  # CLIPの標準偏差
     ])
+
+    # 検証およびテスト用のトランスフォーム
+    val_transform = transforms.Compose([
+        transforms.Resize(224),  # 最短辺を224にリサイズ
+        transforms.CenterCrop(224),  # 中央を224x224でクロップ
+        transforms.ToTensor(),  # PIL Imageまたはnumpy.ndarrayをTensorに変換
+        transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],  # CLIPの平均
+                            std=[0.26862954, 0.26130258, 0.27577711])  # CLIPの標準偏差
+    ])
+
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=val_transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, collate_fn = custom_collate_fn)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn = custom_collate_fntest)
 
-    model = VQAModel(n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(n_answer=len(train_dataset.answer2idx), text_dim=512, image_dim=768, num_heads=8).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 10
     criterion = nn.KLDivLoss(reduction='batchmean')
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
@@ -503,17 +418,31 @@ def main():
         submission.append(pred)
         preds.append(pred)
         pred_answers.append(train_dataset.idx2answer[pred])
+    
+    # 現在の日時を取得し、フォルダ名を生成
+    current_time = datetime.datetime.now()
+    folder_name = current_time.strftime('%Y%m%d%H%M')
+    folder_path = os.path.join('./', folder_name)
+    # フォルダが存在しない場合は作成
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
 
     # CSVファイルに保存
-    with open('predictions.csv', 'w', newline='') as file:
+    csv_file_path = os.path.join(folder_path, 'predictions.csv')
+    with open(csv_file_path, 'w', newline='') as file:
         writer = csv.writer(file)
         writer.writerow(['Prediction Index', 'Answer Text'])
-        for pred, answer in zip(preds, pred_answers):
-            writer.writerow([pred, answer])
+    for pred, answer in zip(preds, pred_answers):
+        writer.writerow([pred, answer])
+    
+    # 提出用ファイルの保存
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
-    torch.save(model.state_dict(), "model.pth")
-    np.save("submission_3.npy", submission)
+    model_path = os.path.join(folder_path, "model.pth")
+    submission_path = os.path.join(folder_path, "submission_3.npy")
+
+    torch.save(model.state_dict(), model_path)
+    np.save(submission_path, submission)
     wandb.finish()
 
 if __name__ == "__main__":

@@ -1,0 +1,19 @@
+
+41024
+image_feature torch.Size([128, 768])
+question_feature torch.Size([128, 512])
+image_feature torch.Size([128, 768])
+question_feature torch.Size([128, 512])
+image_feature torch.Size([128, 768])
+question_feature torch.Size([128, 512])
+image_feature torch.Size([128, 768])
+question_feature torch.Size([128, 512])
+Traceback (most recent call last):
+  File "C:\Users\uta_f\Project\dl_lecture_competition_pub\main.py", line 422, in <module>
+  File "C:\Users\uta_f\Project\dl_lecture_competition_pub\main.py", line 387, in main
+    # wandbによるログ記録
+  File "C:\Users\uta_f\Project\dl_lecture_competition_pub\main.py", line 290, in train
+    total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
+  File "C:\Users\uta_f\Project\dl_lecture_competition_pub\main.py", line 206, in VQA_criterion
+    if pred == answers[j]:
+KeyboardInterrupt

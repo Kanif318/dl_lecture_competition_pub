@@ -1,0 +1,150 @@
+【1/30】
+train time: 556.70 [s]
+train loss: 6.4500
+train acc: 0.4570
+train simple acc: 0.3683
+【2/30】
+train time: 584.39 [s]
+train loss: 6.0411
+train acc: 0.4710
+train simple acc: 0.3790
+【3/30】
+train time: 570.01 [s]
+train loss: 5.6328
+train acc: 0.4795
+train simple acc: 0.3899
+【4/30】
+train time: 566.89 [s]
+train loss: 5.4530
+train acc: 0.4864
+train simple acc: 0.3969
+【5/30】
+train time: 568.59 [s]
+train loss: 5.1254
+train acc: 0.4891
+train simple acc: 0.3985
+【6/30】
+train time: 569.78 [s]
+train loss: 4.7562
+train acc: 0.4940
+train simple acc: 0.4041
+【7/30】
+train time: 534.76 [s]
+train loss: 4.2796
+train acc: 0.4979
+train simple acc: 0.4091
+【8/30】
+train time: 521.15 [s]
+train loss: 3.8231
+train acc: 0.4990
+train simple acc: 0.4122
+【9/30】
+train time: 520.88 [s]
+train loss: 3.4146
+train acc: 0.5025
+train simple acc: 0.4177
+【10/30】
+train time: 523.28 [s]
+train loss: 3.0803
+train acc: 0.5177
+train simple acc: 0.4342
+【11/30】
+train time: 546.16 [s]
+train loss: 2.8471
+train acc: 0.5298
+train simple acc: 0.4445
+【12/30】
+train time: 540.74 [s]
+train loss: 2.6806
+train acc: 0.5397
+train simple acc: 0.4533
+【13/30】
+train time: 540.37 [s]
+train loss: 2.5719
+train acc: 0.5466
+train simple acc: 0.4580
+【14/30】
+train time: 537.31 [s]
+train loss: 2.4950
+train acc: 0.5555
+train simple acc: 0.4654
+【15/30】
+train time: 540.27 [s]
+train loss: 2.4186
+train acc: 0.5601
+train simple acc: 0.4677
+【16/30】
+train time: 539.81 [s]
+train loss: 2.3490
+train acc: 0.5692
+train simple acc: 0.4761
+【17/30】
+train time: 540.23 [s]
+train loss: 2.3106
+train acc: 0.5711
+train simple acc: 0.4777
+【18/30】
+train time: 532.53 [s]
+train loss: 2.2553
+train acc: 0.5773
+train simple acc: 0.4820
+【19/30】
+train time: 531.24 [s]
+train loss: 2.2109
+train acc: 0.5769
+train simple acc: 0.4818
+【20/30】
+train time: 518.83 [s]
+train loss: 2.1709
+train acc: 0.5839
+train simple acc: 0.4876
+【21/30】
+train time: 520.58 [s]
+train loss: 2.1344
+train acc: 0.5867
+train simple acc: 0.4937
+【22/30】
+train time: 518.20 [s]
+train loss: 2.0841
+train acc: 0.5926
+train simple acc: 0.4987
+【23/30】
+train time: 517.58 [s]
+train loss: 2.0458
+train acc: 0.5961
+train simple acc: 0.4970
+【24/30】
+train time: 522.57 [s]
+train loss: 2.0368
+train acc: 0.5963
+train simple acc: 0.4981
+【25/30】
+train time: 522.04 [s]
+train loss: 1.9885
+train acc: 0.6019
+train simple acc: 0.5048
+【26/30】
+train time: 520.98 [s]
+train loss: 1.9409
+train acc: 0.6034
+train simple acc: 0.5031
+【27/30】
+train time: 516.66 [s]
+train loss: 1.9205
+train acc: 0.6055
+train simple acc: 0.5065
+【28/30】
+train time: 518.87 [s]
+train loss: 1.9179
+train acc: 0.6081
+train simple acc: 0.5054
+【29/30】
+train time: 519.92 [s]
+train loss: 1.8541
+train acc: 0.6180
+train simple acc: 0.5181
+【30/30】
+train time: 520.55 [s]
+train loss: 1.8280
+train acc: 0.6194
+train simple acc: 0.5168

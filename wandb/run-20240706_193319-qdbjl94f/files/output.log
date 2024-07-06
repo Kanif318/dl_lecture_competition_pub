@@ -1,0 +1,16 @@
+
+41024
+Traceback (most recent call last):
+  File "C:\Users\uta_f\Project\dl_lecture_competition_pub\main.py", line 421, in <module>
+    main()
+  File "C:\Users\uta_f\Project\dl_lecture_competition_pub\main.py", line 386, in main
+    train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device, train_dataset)
+  File "C:\Users\uta_f\Project\dl_lecture_competition_pub\main.py", line 281, in train
+    pred = model(image, question)
+  File "C:\Users\uta_f\.virtualenvs\dl_lecture_competition_pub-JWry4h2n\lib\site-packages\torch\nn\modules\module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "C:\Users\uta_f\.virtualenvs\dl_lecture_competition_pub-JWry4h2n\lib\site-packages\torch\nn\modules\module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "C:\Users\uta_f\Project\dl_lecture_competition_pub\main.py", line 237, in forward
+    x = torch.cat([image_feature, question_feature], dim=1)
+TypeError: expected Tensor as element 0 in argument 0, but got BaseModelOutputWithPooling

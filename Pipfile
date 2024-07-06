@@ -15,6 +15,7 @@ torchvision = {version = "*", index = "torch_stable"}
 torchaudio = {version = "*", index = "torch_stable"}
 transformers = "*"
 wandb = "*"
+sentencepiece = "*"
 
 [dev-packages]
 
