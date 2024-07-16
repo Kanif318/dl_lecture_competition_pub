@@ -190,33 +190,130 @@ def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
 
     return total_acc / len(batch_pred)
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, dim, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.dim = dim
+        self.head_dim = dim // num_heads
+        
+        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
+
+        # 各ヘッドのための線形変換を個別に定義
+        self.query_projs = nn.ModuleList([nn.Linear(dim, self.head_dim) for _ in range(num_heads)])
+        self.key_projs = nn.ModuleList([nn.Linear(dim, self.head_dim) for _ in range(num_heads)])
+        self.value_projs = nn.ModuleList([nn.Linear(dim, self.head_dim) for _ in range(num_heads)])
+        
+        self.softmax = nn.Softmax(dim=-1)
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, queries, keys, values):
+        # queries(text): (batch_size, sequence_length_text, dim)
+        # keys, values(image): (batch_size, sequence_length_image, dim)
+
+        # 各ヘッドで線形変換を適用
+        queries_heads = [self.dropout(proj(queries)) for proj in self.query_projs]
+        keys_heads = [self.dropout(proj(keys)) for proj in self.key_projs] 
+        values_heads = [self.dropout(proj(values)) for proj in self.value_projs] 
+
+        # 各ヘッドでアテンションを計算
+        attended_values_heads = []
+        for i in range(self.num_heads):
+            attention_scores = torch.matmul(queries_heads[i], keys_heads[i].transpose(-2, -1)) / (self.head_dim ** 0.5)
+            attention_probs = self.softmax(attention_scores)
+            attention_probs = self.dropout(attention_probs)
+            attended_values_heads.append(torch.matmul(attention_probs, values_heads[i]))
+
+        # ヘッドの結果を結合
+        attended_values = torch.cat(attended_values_heads, dim=-1)
+        attended_values = self.dropout(attended_values)
+        attended_values = self.norm(attended_values)
+        
+        return attended_values
+
+class FeatureEnhancerLayer(nn.Module):
+    def __init__(self, dim, num_heads):
+        super(FeatureEnhancerLayer, self).__init__()
+        self.self_attention_text = MultiHeadAttention(dim, num_heads)
+        self.self_attention_image = MultiHeadAttention(dim, num_heads)
+        self.cross_attention_text_to_image = MultiHeadAttention(dim, num_heads)
+        self.cross_attention_image_to_text = MultiHeadAttention(dim, num_heads)
+        self.ffn_text = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
+        self.ffn_image = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
+        self.norm_text = nn.LayerNorm(dim)
+        self.norm_image = nn.LayerNorm(dim)
+
+    def forward(self, text_features, image_features):
+        # Self-Attention
+        text_features = self.self_attention_text(text_features, text_features, text_features)
+        image_features = self.self_attention_image(image_features, image_features, image_features)
+
+        # Cross-Attention
+        text_to_image_features = self.cross_attention_text_to_image(text_features, image_features, image_features)
+        image_to_text_features = self.cross_attention_image_to_text(image_features, text_features, text_features)
+
+        # シーケンス長を揃えるためにパディングを追加
+        if text_to_image_features.size(1) > image_to_text_features.size(1):
+            padding = text_to_image_features.size(1) - image_to_text_features.size(1)
+            image_to_text_features = F.pad(image_to_text_features, (0, 0, 0, padding))
+            image_features = F.pad(image_features, (0, 0, 0, padding))
+        elif image_to_text_features.size(1) > text_to_image_features.size(1):
+            padding = image_to_text_features.size(1) - text_to_image_features.size(1)
+            text_to_image_features = F.pad(text_to_image_features, (0, 0, 0, padding))
+            text_features = F.pad(text_features, (0, 0, 0, padding))
+
+        # Add & Norm
+        text_features = self.norm_text(image_to_text_features)
+        image_features = self.norm_image(text_to_image_features)
+
+        # Feed Forward Network
+        text_features = self.ffn_text(text_features)
+        image_features = self.ffn_image(image_features)
+
+        return text_features, image_features
 
 class VQAModel(nn.Module):
-    def __init__(self, n_answer: int, text_encoder, vision_encoder):
+    def __init__(self, n_answer: int, text_dim, image_dim, text_encoder, vision_encoder, num_heads=8):
         super().__init__()
-        self.vision_encoder = vision_encoder
-        self.text_encoder = text_encoder
-        # Normalize入れる
-        self.fc = nn.Sequential(
-            nn.Linear(1280, 8192),  # 最初の層のユニット数を増やす
-            nn.BatchNorm1d(8192),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(4096, n_answer)
-        )
+        self.text_encoder = text_encoder  # テキストエンコーダー
+        self.image_encoder = vision_encoder  # 画像エンコーダー
+        self.text_projection = nn.Linear(text_dim, image_dim)  # テキスト特徴量を画像特徴量と同じ次元に変換
+        self.text_norm = nn.LayerNorm(image_dim)
+        self.feature_enhancer = FeatureEnhancerLayer(image_dim, num_heads)
+        self.fc1 = nn.Linear(image_dim*2, 4096)
+        self.fc2 = nn.Linear(4096, n_answer)
         self.log_softmax = nn.LogSoftmax(dim=1)
 
-    def forward(self, question, image):
+    def forward(self, text, image):
+        text_features = self.text_encoder(**text).last_hidden_state
+        image_features = self.image_encoder(image).last_hidden_state
+        projected_text_features = self.text_projection(text_features)  # テキスト特徴量を変換
+        projected_text_features = self.text_norm(projected_text_features)
+        
+        # Feature Enhancer Layer
+        enhanced_text_features, enhanced_image_features = self.feature_enhancer(projected_text_features, image_features)
 
-        image_feature = self.vision_encoder(image).pooler_output  # 画像の特徴量
-        question_feature = self.text_encoder(**question).pooler_output # テキストの特徴量
-        # print("image_feature", image_feature.shape)
-        # print("question_feature", question_feature.shape)
+        # 各特徴量の平均を計算
+        pooled_image_features = torch.mean(enhanced_image_features, dim=1)  # 次元1に沿って平均
+        pooled_text_features = torch.mean(enhanced_text_features, dim=1)  # 次元1に沿って平均
+        #print("shapeimage", pooled_image_features.shape)
+        #print("shapetext", pooled_text_features.shape)
+        
 
-        x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(x)
-
-        return self.log_softmax(x)
+        features = torch.cat([pooled_image_features, pooled_text_features], dim=1)
+        # print("featuresshape", features.shape)
+        output = self.fc1(features)
+        output = self.fc2(output)
+        return self.log_softmax(output)
 
 def calculate_soft_labels(answers, num_classes, device, unanswerable_idx):
     batch_size, num_answers = answers.shape
@@ -242,7 +339,7 @@ def calculate_soft_labels(answers, num_classes, device, unanswerable_idx):
     return soft_labels
 
 # 4. 学習の実装
-def train(model, dataloader, optimizer,criterion, device, dataset, unanswerable_idx):
+def train(model, dataloader, optimizer, scheduler_cyclic,criterion, device, dataset, unanswerable_idx):
     dataset = dataset
     model.train()
     scaler = GradScaler()  # Mixed Precision Trainingのためのスケーラー
@@ -268,6 +365,7 @@ def train(model, dataloader, optimizer,criterion, device, dataset, unanswerable_
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+        scheduler_cyclic.step()  # CyclicLRの更新
 
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
@@ -295,15 +393,16 @@ class CustomCollate:
         return images, questions
 
 def main():
-    wandb.init(
-        config={
-        "architecture": "CLIP+FC",
-        "dataset": "VizWiz",
-        "epochs": 100,
-        "learning_rate": "Cyclic",
-        "batch_size":512
-        }
-    )
+    # wandb.init(
+    #     config={
+    #     "architecture": "CLIP+cross-attention+FC",
+    #     "dataset": "VizWiz",
+    #     "epochs": 100,
+    #     "learning_rate": "Cyclic",
+    #     "batch_size":512
+    #     },
+    #     reinit=True
+    # )
     # deviceの設定
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -317,7 +416,7 @@ def main():
     #トークナイザー
     tokenizer = processor.tokenizer
 
-    # すべてのパラメータを凍結
+    #すべてのパラメータを凍結
     for param in text_encoder.parameters():
         param.requires_grad = False
     for param in vision_encoder.parameters():
@@ -356,29 +455,24 @@ def main():
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=512, shuffle=True, collate_fn = collate_obj.collate_fn, num_workers=int(os.cpu_count()/2), pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn = collate_obj.collate_fntest, num_workers=int(os.cpu_count()/2), pin_memory=True)
 
-    model = VQAModel(n_answer=len(train_dataset.answer2idx), text_encoder=text_encoder, vision_encoder= vision_encoder).to(device)
+    model = VQAModel(n_answer=len(train_dataset.answer2idx), text_dim=512, image_dim=768, text_encoder=text_encoder, vision_encoder= vision_encoder).to(device)
 
     # optimizer / criterion
     num_epoch = 100
     criterion = nn.KLDivLoss(reduction='batchmean')
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-     # ExponentialLRの設定
+    # CyclicLRの設定
+    scheduler_cyclic = CyclicLR(optimizer, base_lr=0.0001, max_lr=0.0005, step_size_up=200, mode='triangular')
+    # ExponentialLRの設定
     scheduler_exp = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.75)
 
     # train model
     for epoch in range(num_epoch):
-        if epoch == 20:
-            for layer in list(text_encoder.children())[-1:]:
-                for param in layer.parameters():
-                    param.requires_grad = True
-            for layer in list(vision_encoder.children())[-1:]:
-                for param in layer.parameters():
-                    param.requires_grad = True
         # エポック開始時の学習率を確認
         current_lr = optimizer.param_groups[0]['lr']
         print(f"エポック {epoch+1} の開始時の学習率: {current_lr:.6f}")
         model.train()
-        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device, train_dataset, unanswerable_idx)
+        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, scheduler_cyclic, criterion, device, train_dataset, unanswerable_idx)
         # wandbによるログ記録
         # wandb.log({"loss": train_loss, "accuracy": train_acc, "simple_accuracy": train_simple_acc})
         print(f"【{epoch + 1}/{num_epoch}】\n"
@@ -388,32 +482,34 @@ def main():
               f"train simple acc: {train_simple_acc:.4f}")
         scheduler_exp.step()  # ExponentialLRの更新
 
-    # 提出用ファイルの作成
-    model.eval()
-    submission = []
-    for image, question in test_loader:
-        image, question = image.to(device), question.to(device)
-        pred = model(question, image)
-        pred = pred.argmax(1).cpu().item()
-        submission.append(pred)
+        # 提出用ファイルの作成
+        if (epoch >= 5):
+            model.eval()
+            submission = []
+            for image, question in test_loader:
+                image, question = image.to(device), question.to(device)
+                pred = model(question, image)
+                pred = pred.argmax(1).cpu().item()
+                submission.append(pred)
 
-    # 現在の日時を取得し、フォルダ名を生成
-    current_time = datetime.datetime.now()
-    folder_name = f"{current_time.strftime('%Y%m%d%H%M')}"
-    folder_path = os.path.join('./', folder_name)
-    # フォルダが存在しない場合は作成
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
+            # 現在の日時を取得し、フォルダ名を生成
+            current_time = datetime.datetime.now()
+            folder_name = f"{current_time.strftime('%Y%m%d%H%M')}_epoch{epoch+1}"
+            folder_path = os.path.join('./', folder_name)
+            # フォルダが存在しない場合は作成
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path)
+    
+            # 提出用ファイルの保存
+            submission = [train_dataset.idx2answer[id] for id in submission]
+            submission = np.array(submission)
+            submission_path = os.path.join(folder_path, "submission_3.npy")
+            np.save(submission_path, submission)
 
-    # 提出用ファイルの保存
-    submission = [train_dataset.idx2answer[id] for id in submission]
-    submission = np.array(submission)
-    submission_path = os.path.join(folder_path, "submission_3.npy")
-    np.save(submission_path, submission)
 
     model_path = os.path.join(folder_path, "model.pth")
     torch.save(model.state_dict(), model_path)
-    wandb.finish()
+    # wandb.finish()
 
 if __name__ == "__main__":
     main()

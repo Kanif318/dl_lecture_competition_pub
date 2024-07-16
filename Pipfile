@@ -16,6 +16,9 @@ torchaudio = {version = "*", index = "torch_stable"}
 transformers = "*"
 wandb = "*"
 sentencepiece = "*"
+opencv-python = "*"
+plotly = "*"
+matplotlib = "*"
 
 [dev-packages]
 

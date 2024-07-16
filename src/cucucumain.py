@@ -10,14 +10,32 @@ import numpy as np
 import pandas
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.transforms import functional as F
 from torchvision import transforms
 from torch import Tensor
+import torch.nn.functional as F
+import csv
 import wandb
 from transformers import CLIPProcessor, CLIPModel
-from torch.optim.lr_scheduler import CyclicLR
-from torch.cuda.amp import autocast, GradScaler
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+# テキストエンコーダーを取得
+text_encoder = model.text_model.to(device)
+# 画像エンコーダーを取得
+vision_encoder = model.vision_model.to(device)
+#トークナイザー
+tokenizer = processor.tokenizer
+
+#すべてのパラメータを凍結
+for param in text_encoder.parameters():
+    param.requires_grad = False
+for param in vision_encoder.parameters():
+    param.requires_grad = False
+
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -27,6 +45,7 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
 
 #テキストの前処理
 def process_text(text):
@@ -190,51 +209,93 @@ def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
 
     return total_acc / len(batch_pred)
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, dim, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.dim = dim
+        self.head_dim = dim // num_heads
+        
+        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
+
+        # 各ヘッドのための線形変換を個別に定義
+        self.query_projs = nn.ModuleList([nn.Linear(dim, self.head_dim) for _ in range(num_heads)])
+        self.key_projs = nn.ModuleList([nn.Linear(dim, self.head_dim) for _ in range(num_heads)])
+        self.value_projs = nn.ModuleList([nn.Linear(dim, self.head_dim) for _ in range(num_heads)])
+        
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, queries, keys, values):
+        # queries(text): (batch_size, sequence_length_text, dim)
+        # keys, values(image): (batch_size, sequence_length_image, dim)
+        # print("Queries shape:", queries.shape)
+        # print("Keys shape:", keys.shape)
+        # print("Values shape:", values.shape)
+
+        # 各ヘッドで線形変換を適用
+        queries_heads = [proj(queries) for proj in self.query_projs]
+        keys_heads = [proj(keys) for proj in self.key_projs]
+        values_heads = [proj(values) for proj in self.value_projs]
+
+        # 各ヘッドでアテンションを計算
+        attended_values_heads = []
+        for i in range(self.num_heads):
+            attention_scores = torch.matmul(queries_heads[i], keys_heads[i].transpose(-2, -1)) / (self.head_dim ** 0.5)
+            attention_probs = self.softmax(attention_scores)
+            attended_values_heads.append(torch.matmul(attention_probs, values_heads[i]))
+        # print("attended_values_heads", attended_values_heads)
+
+        # ヘッドの結果を結合
+        attended_values = torch.cat(attended_values_heads, dim=-1)
+        # print("attended_values", attended_values.shape)
+        
+        return attended_values
 
 class VQAModel(nn.Module):
-    def __init__(self, n_answer: int, text_encoder, vision_encoder):
+    def __init__(self, n_answer: int, text_dim, image_dim):
         super().__init__()
-        self.vision_encoder = vision_encoder
-        self.text_encoder = text_encoder
-        # Normalize入れる
+        self.text_encoder = text_encoder  # テキストエンコーダー
+        self.image_encoder = vision_encoder  # 画像エンコーダー
+        self.text_projection = nn.Linear(text_dim, image_dim)  # テキスト特徴量を画像特徴量と同じ次元に変換
+        self.cross_attention = MultiHeadAttention(768, 8)
         self.fc = nn.Sequential(
-            nn.Linear(1280, 8192),  # 最初の層のユニット数を増やす
-            nn.BatchNorm1d(8192),
+            nn.Linear(image_dim*3, 1024),
+            nn.BatchNorm1d(1024),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(4096, n_answer)
+            nn.Dropout(0.5),
+            nn.Linear(1024, n_answer)
         )
         self.log_softmax = nn.LogSoftmax(dim=1)
 
-    def forward(self, question, image):
+    def forward(self, text, image):
+        text_features = self.text_encoder(**text).last_hidden_state
+        image_features = self.image_encoder(image).last_hidden_state
+        text_features = self.text_projection(text_features)  # テキスト特徴量を変換
+        cross_features = self.cross_attention(text_features, image_features, image_features)
+        # 各特徴量の平均を計算
+        pooled_image_features = torch.mean(image_features, dim=1)  # 次元1に沿って平均
+        pooled_text_features = torch.mean(text_features, dim=1)  # 次元1に沿って平均
+        pooled_cross_features = torch.mean(cross_features, dim=1)  # 次元1に沿って平均
+        
+        features = torch.cat([pooled_cross_features, pooled_image_features, pooled_text_features], dim=1)
+        output = self.fc(features)
+        return self.log_softmax(output)
 
-        image_feature = self.vision_encoder(image).pooler_output  # 画像の特徴量
-        question_feature = self.text_encoder(**question).pooler_output # テキストの特徴量
-        # print("image_feature", image_feature.shape)
-        # print("question_feature", question_feature.shape)
-
-        x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(x)
-
-        return self.log_softmax(x)
-
-def calculate_soft_labels(answers, num_classes, device, unanswerable_idx):
+def calculate_soft_labels(answers, num_classes):
     batch_size, num_answers = answers.shape
 
     answers = answers.long()
 
     soft_labels = torch.zeros(batch_size, num_classes).to(device)
-
+    #answersはバッチで入ってきているので，バッチサイズ＊回答数
+    #answerは10個（回答数）のインデックス
+    # バッチ内の各データポイントに対して処理
     for i in range(batch_size):
         label_counts = torch.zeros(num_classes).to(device)
         
         # 各回答に対するカウント
         for j in range(num_answers):
-            answer_idx = answers[i, j]
-            if answer_idx != unanswerable_idx:
-                label_counts[answer_idx] += 1.1  # unanswerableでない回答は1.1倍にカウント
-            else:
-                label_counts[answer_idx] += 1  # unanswerableの回答は通常通りカウント
+            label_counts[answers[i, j]] += 1
         
         # ソフトラベルを計算（正規化）
         soft_labels[i] = label_counts / label_counts.sum()
@@ -242,10 +303,9 @@ def calculate_soft_labels(answers, num_classes, device, unanswerable_idx):
     return soft_labels
 
 # 4. 学習の実装
-def train(model, dataloader, optimizer,criterion, device, dataset, unanswerable_idx):
+def train(model, dataloader, optimizer, criterion, device, dataset):
     dataset = dataset
     model.train()
-    scaler = GradScaler()  # Mixed Precision Trainingのためのスケーラー
 
     total_loss = 0
     total_acc = 0
@@ -258,16 +318,14 @@ def train(model, dataloader, optimizer,criterion, device, dataset, unanswerable_
         image, question, answers, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
         
-        soft_labels = calculate_soft_labels(answers, num_classes=len(dataset.answer2idx), device=device, unanswerable_idx=unanswerable_idx)
+        soft_labels = calculate_soft_labels(answers, num_classes=len(dataset.answer2idx))
         soft_labels = soft_labels.to(device)
+        pred = model(question, image)
+        loss = criterion(pred, soft_labels)
 
         optimizer.zero_grad()
-        with autocast():  # Mixed Precision Trainingのためのautocast
-            pred = model(question, image)
-            loss = criterion(pred, soft_labels)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        optimizer.step()
 
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
@@ -276,61 +334,44 @@ def train(model, dataloader, optimizer,criterion, device, dataset, unanswerable_
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
-class CustomCollate:
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
+def custom_collate_fn(batch):
+    images, questions, answers, mode_answers = zip(*batch)
+    # 画像はそのままスタック
+    images = torch.stack(images, dim=0)
+    # 質問はパディング
+    questions = tokenizer(list(questions), padding=True, return_tensors='pt')
+    # 回答も同様にパディング
+    answers = torch.stack(answers, dim=0)
+    mode_answers = torch.tensor(mode_answers, dtype = torch.long)
+    return images, questions, answers, mode_answers
 
-    def collate_fn(self, batch):
-        images, questions, answers, mode_answers = zip(*batch)
-        images = torch.stack(images, dim=0)
-        questions = self.tokenizer(list(questions), padding=True, return_tensors='pt')
-        answers = torch.stack(answers, dim=0)
-        mode_answers = torch.tensor(mode_answers, dtype=torch.long)
-        return images, questions, answers, mode_answers
-
-    def collate_fntest(self, batch):
-        images, questions = zip(*batch)
-        images = torch.stack(images, dim=0)
-        questions = self.tokenizer(list(questions), padding=True, return_tensors='pt')
-        return images, questions
+def custom_collate_fntest(batch):
+    images, questions = zip(*batch)
+    # 画像はそのままスタック
+    images = torch.stack(images, dim=0)
+    # 質問はパディング
+    questions = tokenizer(list(questions), padding=True, return_tensors='pt')
+    return images, questions
 
 def main():
     wandb.init(
+        project="vqa_project",
         config={
-        "architecture": "CLIP+FC",
+        "architecture": "CLIP+cross-attention+FC",
         "dataset": "VizWiz",
-        "epochs": 100,
-        "learning_rate": "Cyclic",
+        "epochs": 5,
+        "learning_rate": 0.001,
         "batch_size":512
         }
     )
+
     # deviceの設定
     set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    # テキストエンコーダーを取得
-    text_encoder = model.text_model.to(device)
-    # 画像エンコーダーを取得
-    vision_encoder = model.vision_model.to(device)
-    #トークナイザー
-    tokenizer = processor.tokenizer
-
-    # すべてのパラメータを凍結
-    for param in text_encoder.parameters():
-        param.requires_grad = False
-    for param in vision_encoder.parameters():
-        param.requires_grad = False
-
-    # collate_fnの生成
-    collate_obj = CustomCollate(tokenizer)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # CLIPに合わせた画像前処理にデータ拡張を追加
     transform = transforms.Compose([
     transforms.RandomHorizontalFlip(),  # 画像をランダムに水平フリップ
-    transforms.RandomVerticalFlip(),
-    # transforms.RandomRotation(20),  # 20度の範囲でランダムに回転
     transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1),  # 色調のランダムな調整
     transforms.Resize(224),  # 最短辺を224にリサイズ
     transforms.CenterCrop(224),  # 中央を224x224でクロップ
@@ -351,44 +392,30 @@ def main():
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=val_transform, answer=False)
     test_dataset.update_dict(train_dataset)
-    unanswerable_idx = train_dataset.answer2idx['unanswerable']
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=512, shuffle=True, collate_fn = collate_obj.collate_fn, num_workers=int(os.cpu_count()/2), pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn = collate_obj.collate_fntest, num_workers=int(os.cpu_count()/2), pin_memory=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=512, shuffle=True, collate_fn = custom_collate_fn)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn = custom_collate_fntest)
 
-    model = VQAModel(n_answer=len(train_dataset.answer2idx), text_encoder=text_encoder, vision_encoder= vision_encoder).to(device)
+    model = VQAModel(n_answer=len(train_dataset.answer2idx), text_dim=512, image_dim=768).to(device)
 
     # optimizer / criterion
-    num_epoch = 100
+    num_epoch = 10
     criterion = nn.KLDivLoss(reduction='batchmean')
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-     # ExponentialLRの設定
-    scheduler_exp = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.75)
 
     # train model
     for epoch in range(num_epoch):
-        if epoch == 20:
-            for layer in list(text_encoder.children())[-1:]:
-                for param in layer.parameters():
-                    param.requires_grad = True
-            for layer in list(vision_encoder.children())[-1:]:
-                for param in layer.parameters():
-                    param.requires_grad = True
-        # エポック開始時の学習率を確認
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"エポック {epoch+1} の開始時の学習率: {current_lr:.6f}")
-        model.train()
-        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device, train_dataset, unanswerable_idx)
+
+        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device, train_dataset)
         # wandbによるログ記録
-        # wandb.log({"loss": train_loss, "accuracy": train_acc, "simple_accuracy": train_simple_acc})
+        wandb.log({"loss": train_loss, "accuracy": train_acc, "simple_accuracy": train_simple_acc})
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
               f"train loss: {train_loss:.4f}\n"
               f"train acc: {train_acc:.4f}\n"
               f"train simple acc: {train_simple_acc:.4f}")
-        scheduler_exp.step()  # ExponentialLRの更新
 
-    # 提出用ファイルの作成
+# 提出用ファイルの作成
     model.eval()
     submission = []
     for image, question in test_loader:
@@ -396,15 +423,15 @@ def main():
         pred = model(question, image)
         pred = pred.argmax(1).cpu().item()
         submission.append(pred)
-
+    
     # 現在の日時を取得し、フォルダ名を生成
     current_time = datetime.datetime.now()
-    folder_name = f"{current_time.strftime('%Y%m%d%H%M')}"
+    folder_name = current_time.strftime('%Y%m%d%H%M')
     folder_path = os.path.join('./', folder_name)
     # フォルダが存在しない場合は作成
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
-
+    
     # 提出用ファイルの保存
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)

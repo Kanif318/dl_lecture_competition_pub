@@ -232,7 +232,7 @@ def calculate_soft_labels(answers, num_classes, device, unanswerable_idx):
         for j in range(num_answers):
             answer_idx = answers[i, j]
             if answer_idx != unanswerable_idx:
-                label_counts[answer_idx] += 1.1  # unanswerableでない回答は1.1倍にカウント
+                label_counts[answer_idx] += 1  # unanswerableでない回答は1.1倍にカウント
             else:
                 label_counts[answer_idx] += 1  # unanswerableの回答は通常通りカウント
         
@@ -363,7 +363,7 @@ def main():
     criterion = nn.KLDivLoss(reduction='batchmean')
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
      # ExponentialLRの設定
-    scheduler_exp = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.75)
+    scheduler_exp = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
     # train model
     for epoch in range(num_epoch):
@@ -388,28 +388,30 @@ def main():
               f"train simple acc: {train_simple_acc:.4f}")
         scheduler_exp.step()  # ExponentialLRの更新
 
-    # 提出用ファイルの作成
-    model.eval()
-    submission = []
-    for image, question in test_loader:
-        image, question = image.to(device), question.to(device)
-        pred = model(question, image)
-        pred = pred.argmax(1).cpu().item()
-        submission.append(pred)
+        # 提出用ファイルの作成
+        if (epoch >= 5):
+            model.eval()
+            submission = []
+            for image, question in test_loader:
+                image, question = image.to(device), question.to(device)
+                pred = model(question, image)
+                pred = pred.argmax(1).cpu().item()
+                submission.append(pred)
 
-    # 現在の日時を取得し、フォルダ名を生成
-    current_time = datetime.datetime.now()
-    folder_name = f"{current_time.strftime('%Y%m%d%H%M')}"
-    folder_path = os.path.join('./', folder_name)
-    # フォルダが存在しない場合は作成
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
+            # 現在の日時を取得し、フォルダ名を生成
+            current_time = datetime.datetime.now()
+            folder_name = f"{current_time.strftime('%Y%m%d%H%M')}_epoch{epoch+1}"
+            folder_path = os.path.join('./', folder_name)
+            # フォルダが存在しない場合は作成
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path)
+    
+            # 提出用ファイルの保存
+            submission = [train_dataset.idx2answer[id] for id in submission]
+            submission = np.array(submission)
+            submission_path = os.path.join(folder_path, "submission_3.npy")
+            np.save(submission_path, submission)
 
-    # 提出用ファイルの保存
-    submission = [train_dataset.idx2answer[id] for id in submission]
-    submission = np.array(submission)
-    submission_path = os.path.join(folder_path, "submission_3.npy")
-    np.save(submission_path, submission)
 
     model_path = os.path.join(folder_path, "model.pth")
     torch.save(model.state_dict(), model_path)
